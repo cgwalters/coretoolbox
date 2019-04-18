@@ -5,6 +5,7 @@ authors = ["Colin Walters <walters@verbum.org>"]
 edition = "2018"
 
 [dependencies]
+nix = "0.13"
 clap = "2.32.0"
 structopt = "0.2"
 directories = "1.0"
