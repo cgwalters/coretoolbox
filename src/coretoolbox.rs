@@ -1,18 +1,7 @@
-use std::{fs, io};
-use std::io::prelude::*;
-use std::borrow::Cow;
-use std::collections::HashMap;
 use structopt::StructOpt;
-#[macro_use]
-extern crate clap;
 use directories;
-#[macro_use]
-extern crate failure;
 use failure::Fallible;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate serde_derive;
+use lazy_static::lazy_static;
 
 lazy_static! {
     static ref APPDIRS : directories::ProjectDirs = directories::ProjectDirs::from("org", "openshift", "xokdinst").expect("creating appdirs");
@@ -27,10 +16,14 @@ enum Opt {
     Enter,
 }
 
+fn enter() -> Fallible<()> {
+    Ok(())
+}
+
 /// Primary entrypoint
 fn main() -> Fallible<()> {
     match Opt::from_args() {
-        Opt::Enter(o) => {
+        Opt::Enter => {
             enter()?;
         },
     }
