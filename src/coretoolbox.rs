@@ -1,10 +1,11 @@
 use structopt::StructOpt;
+use std::process::{Command, Stdio};
 use directories;
-use failure::Fallible;
+use failure::{Fallible, bail};
 use lazy_static::lazy_static;
 
 lazy_static! {
-    static ref APPDIRS : directories::ProjectDirs = directories::ProjectDirs::from("org", "openshift", "xokdinst").expect("creating appdirs");
+    static ref APPDIRS : directories::ProjectDirs = directories::ProjectDirs::from("com", "coreos", "toolbox").expect("creating appdirs");
 }
 
 static PRESERVED_ENV : &[&str] = &["COLORTERM", 
@@ -33,30 +34,30 @@ static DEFAULT_IMAGE : &str = "registry.fedoraproject.org/f30/fedora-toolbox:30"
 #[structopt(name = "coretoolbox", about = "Toolbox")]
 #[structopt(rename_all = "kebab-case")]
 /// Main options struct
-enum Opt {
-    /// Enter toolbox
-    Enter,
+struct Opt {
 }
 
-fn podman() -> std::process::Command {
-    let mut cmd = std::process::Command::new("podman");
+fn podman() -> Command {
+    Command::new("podman")
 }
 
 fn ensure_image(name: &str) -> Fallible<()> {
-
+    if !podman().args(&["inspect", name]).stdout(Stdio::null()).status()?.success() {
+        if !podman().args(&["pull", name]).status()?.success() {
+            bail!("Failed to pull image");
+        }
+    }
+    Ok(())
 }
 
-fn enter() -> Fallible<()> {
+fn run() -> Fallible<()> {
+    ensure_image(DEFAULT_IMAGE)?;
     Ok(())
 }
 
 /// Primary entrypoint
 fn main() -> Fallible<()> {
-    match Opt::from_args() {
-        Opt::Enter => {
-            enter()?;
-        },
-    }
-
+    let opts = Opt::from_args();
+    run()?;
     Ok(())
 }
