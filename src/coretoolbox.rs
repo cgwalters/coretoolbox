@@ -76,9 +76,9 @@ fn ensure_image(name: &str) -> Fallible<()> {
     Ok(())
 }
 
-fn getenv_required_utf8(n: &str) -> Result<String> {
+fn getenv_required_utf8(n: &str) -> Fallible<String> {
     if let Some(v) = std::env::var_os(n) {
-        v.to_str().ok_or_else(|| failure::format_err!("{} is invalid UTF-8", n))?.to_string()
+        Ok(v.to_str().ok_or_else(|| failure::format_err!("{} is invalid UTF-8", n))?.to_string())
     } else {
         bail!("{} is unset", n)
     }
@@ -87,17 +87,16 @@ fn getenv_required_utf8(n: &str) -> Result<String> {
 fn run(opts: Opt) -> Fallible<()> {
     ensure_image(&opts.image)?;
 
-    // Copy our own binary to the runtime dir so we can
     // exec ourself as the entrypoint.  In the future this
     // would be better with podman fd passing.
-    let xdg_runtime_dir = getenv_required_utf8("XDG_RUNTIME_DIR")?;
-    let xdg_self_path = format!("{}/toolbox.entrypoint", xdg_runtime_dir);
-    std::fs::copy("/proc/self/exe", xdg_self_path)?;
+    let self_bin = std::fs::read_link("/proc/self/exe")?;
+    let self_bin = self_bin.as_path().to_str().ok_or_else(|| failure::err_msg("non-UTF8 self"))?;
 
     let mut podman = cmd_podman();
     podman.args(&["run", "--rm", "-ti", "--hostname", "toolbox",
                   "--name", "coreos-toolbox", "--network", "host",
                   "--privileged", "--security-opt", "label-disable"]);
+    podman.arg(format!("--volume={}:/toolbox.entrypoint:rslave", self_bin));
     let real_uid : u32 = nix::unistd::getuid().into();
     let uid_plus_one = real_uid + 1;             
     let max_minus_uid = MAX_UID_COUNT - real_uid;     
@@ -128,7 +127,7 @@ fn run(opts: Opt) -> Fallible<()> {
         let v = v.to_str().ok_or_else(|| failure::format_err!("{} contains invalid UTF-8", n))?;
         podman.arg(format!("--env={}={}", n, v));
     }
-    podman.arg("--entrypoint={}", xdg_self_path)
+    podman.arg("--entrypoint=/toolbox.entrypoint");
     podman.arg(opts.image);
     eprintln!("running {:?}", podman);
     if !podman.status()?.success() {
@@ -137,13 +136,22 @@ fn run(opts: Opt) -> Fallible<()> {
     Ok(())
 }
 
+fn entrypoint() -> Fallible<()> {
+    println!("entrypoint");    
+    Ok(())
+}
+
 /// Primary entrypoint
 fn main() -> Fallible<()> {
+    let argv0 = std::env::args().next().expect("argv0");
+    if argv0.ends_with(".entrypoint") {
+        return entrypoint();
+    }
     let opts = Opt::from_args();
     if let Some(cmd) = opts.cmd.as_ref() {
         match cmd {
             Cmd::Entrypoint => {
-                println!("entrypoint");
+                return entrypoint();
             }
         }
     } else {
