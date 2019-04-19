@@ -35,6 +35,20 @@ static PRESERVED_ENV : &[&str] = &["COLORTERM",
         "XDG_VTNR",
 ];
 
+trait CommandRunExt {
+    fn run(&mut self) -> Fallible<()>;
+}
+
+impl CommandRunExt for Command {
+    fn run(&mut self) -> Fallible<()> {
+        let r = self.status()?;
+        if !r.success() {
+            bail!("Child exited: {}", r);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, StructOpt)]
 #[structopt(name = "coretoolbox", about = "Toolbox")]
 #[structopt(rename_all = "kebab-case")]
@@ -86,9 +100,7 @@ fn podman_has(t: InspectType, name: &str) -> Fallible<bool> {
 /// Pull a container image if not present
 fn ensure_image(name: &str) -> Fallible<()> {
     if !podman_has(InspectType::Image, name)? {
-        if !cmd_podman().args(&["pull", name]).status()?.success() {
-            bail!("Failed to pull image");
-        }
+        cmd_podman().args(&["pull", name]).run()?;
     }
     Ok(())
 }
@@ -105,6 +117,7 @@ fn getenv_required_utf8(n: &str) -> Fallible<String> {
 struct EntrypointState {
     username: String,
     uid: u32,
+    home: String,
     ostree_based_host: bool,
 }
 
@@ -125,7 +138,7 @@ fn run(opts: Opt) -> Fallible<()> {
     let mut podman = cmd_podman();
     podman.args(&["run", "--rm", "-ti", "--hostname", "toolbox",
                   "--name", "coreos-toolbox", "--network", "host",
-                  "--privileged", "--security-opt", "label-disable"]);
+                  "--privileged", "--security-opt", "label=disable"]);
     podman.arg(format!("--volume={}:/toolbox.entrypoint:rslave", self_bin));
     let real_uid : u32 = nix::unistd::getuid().into();
     let uid_plus_one = real_uid + 1;             
@@ -163,6 +176,7 @@ fn run(opts: Opt) -> Fallible<()> {
         let state = EntrypointState {
             username: getenv_required_utf8("USER")?,
             uid: real_uid,
+            home: getenv_required_utf8("HOME")?,
             ostree_based_host: is_ostree_based_host(),
         };
         let w = std::fs::File::create(format!("{}/{}", runtime_dir, statefile))?;
@@ -178,35 +192,61 @@ fn run(opts: Opt) -> Fallible<()> {
 }
 
 mod entrypoint {
-    use failure::{Fallible, bail};
+    use failure::{Fallible};
     use std::process::Command;
     use std::os::unix::process::CommandExt;
+    use std::os::unix;
+    use super::CommandRunExt;
+    use super::EntrypointState;
 
-    fn adduser(name: &str, uid: u32) -> Fallible<()> {
-        let uidstr = format!("{}", uid);
-        if !Command::new("useradd")
-            .args(&["--no-create-home", "--uid", &uidstr,
-                    "--groups", "wheel", name])
-            .status()?.success() {
-                bail!("Failed to useradd");
-        }
+    fn adduser(state: &EntrypointState) -> Fallible<()> {
+        let uidstr = format!("{}", state.uid);
+        Command::new("useradd")
+            .args(&["--no-create-home", "--home-dir", &state.home,
+                    "--uid", &uidstr,
+                    "--groups", "wheel",
+                    state.username.as_str()])
+            .run()?;
+
+        // Bind mount the homedir rather than use symlinks
+        // as various software is unhappy if the path isn't canonical.
+        std::fs::create_dir_all(&state.home)?;
+        let uid = nix::unistd::Uid::from_raw(state.uid);
+        let gid = nix::unistd::Gid::from_raw(state.uid);
+        nix::unistd::chown(state.home.as_str(), Some(uid), Some(gid))?;
+        let host_home = format!("/host{}", state.home);
+        Command::new("mount")
+            .args(&["--bind", host_home.as_str(), state.home.as_str()])
+            .run()?;
         Ok(())
     }
 
     pub(crate) fn entrypoint() -> Fallible<()> {
         let statefile = super::getenv_required_utf8("TOOLBOX_STATEFILE")?;
         let runtime_dir = super::getenv_required_utf8("XDG_RUNTIME_DIR")?;
-        let state : super::EntrypointState = {
-            let f = std::fs::File::open(format!("/host/{}/{}", runtime_dir, statefile))?;
+        let state : EntrypointState = {
+            let p = format!("/host/{}/{}", runtime_dir, statefile);
+            let f = std::fs::File::open(&p)?;
+            std::fs::remove_file(p)?;
             serde_json::from_reader(std::io::BufReader::new(f))?
         };
 
-        adduser(&state.username, state.uid)?;
+        if state.ostree_based_host {
+            std::fs::remove_dir("/home")?;
+            unix::fs::symlink("../var/home", "/home")?;
+            std::fs::create_dir("/var/home")?;
+        }
 
-        let shell = std::env::var_os("SHELL").unwrap_or("sh".into())
-            .into_string().map_err(|_| failure::err_msg("Invalid SHELL"))?;
-        Command::new(shell).exec();
-        Err(Command::new("sh").exec().into())
+        // Propagate "data" directories to the host
+        for d in &["/srv", "/media", "/mnt"] {
+            std::fs::remove_dir(d)?;
+            let hostd = format!("host{}", d);
+            unix::fs::symlink(hostd, d)?;
+        }
+
+        adduser(&state)?;
+
+        Err(Command::new("su").args(&["-", &state.username]).exec().into())
     }
 }
 
