@@ -1,5 +1,6 @@
 use structopt::StructOpt;
 use std::path::Path;
+use std::ffi::{CString, OsString};
 use std::process::{Command, Stdio};
 use directories;
 use failure::{Fallible, bail};
@@ -137,7 +138,12 @@ fn run(opts: Opt) -> Fallible<()> {
 }
 
 fn entrypoint() -> Fallible<()> {
-    println!("entrypoint");    
+    let shell = std::env::var_os("SHELL").unwrap_or("sh".into())
+        .into_string().map_err(|e| failure::err_msg("Invalid SHELL"))?;
+    let shell = CString::new(shell)?;
+    nix::unistd::execvp(&shell, &[]).ok();
+    let sh = CString::new("sh")?;
+    nix::unistd::execvp(&sh, &[])?;
     Ok(())
 }
 
