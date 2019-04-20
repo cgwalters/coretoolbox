@@ -707,7 +707,7 @@ create()
 )
 
 
-enter()
+enter(
 (
     shell_to_exec=/bin/bash
 

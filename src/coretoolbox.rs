@@ -13,6 +13,7 @@ lazy_static! {
     static ref APPDIRS : directories::ProjectDirs = directories::ProjectDirs::from("com", "coreos", "toolbox").expect("creating appdirs");
 }
 
+static CONTAINER_NAME : &str = "coreos-toolbox";
 static MAX_UID_COUNT : u32 = 65536;
 
 static PRESERVED_ENV : &[&str] = &["COLORTERM", 
@@ -66,6 +67,7 @@ struct Opt {
 #[structopt(rename_all = "kebab-case")]
 enum Cmd {
     Entrypoint,
+    Exec,
 }
 
 fn cmd_podman() -> Command {
@@ -87,6 +89,8 @@ enum InspectType {
     Image,
 }
 
+/// Returns true if an image or container is in the podman
+/// storage.
 fn podman_has(t: InspectType, name: &str) -> Fallible<bool> {
     let typearg = match t {
         InspectType::Container => "container",
@@ -106,6 +110,7 @@ fn ensure_image(name: &str) -> Fallible<()> {
     Ok(())
 }
 
+/// Parse an extant environment variable as UTF-8
 fn getenv_required_utf8(n: &str) -> Fallible<String> {
     if let Some(v) = std::env::var_os(n) {
         Ok(v.to_str().ok_or_else(|| failure::format_err!("{} is invalid UTF-8", n))?.to_string())
@@ -122,24 +127,25 @@ struct EntrypointState {
     ostree_based_host: bool,
 }
 
-fn run(opts: Opt) -> Fallible<()> {
+fn create(opts: &Opt) -> Fallible<()> {
     ensure_image(&opts.image)?;
+
+    if podman_has(InspectType::Container, CONTAINER_NAME)? {
+        return Ok(())
+    }
 
     // exec ourself as the entrypoint.  In the future this
     // would be better with podman fd passing.
     let self_bin = std::fs::read_link("/proc/self/exe")?;
     let self_bin = self_bin.as_path().to_str().ok_or_else(|| failure::err_msg("non-UTF8 self"))?;
 
-    // Serialize our
-    let pid : i32 = nix::unistd::getpid().as_raw().into();
     let runtime_dir = getenv_required_utf8("XDG_RUNTIME_DIR")?;
-    let r : u32 = rand::random();
-    let statefile = format!("toolbox-data-{}-{:x}", pid, r);
+    let statefile = "coreos-toolbox.initdata";
 
     let mut podman = cmd_podman();
-    podman.args(&["run", "--rm", "-ti", "--hostname", "toolbox",
-                  "--name", "coreos-toolbox", "--network", "host",
-                  "--privileged", "--security-opt", "label=disable"]);
+    podman.args(&["create", "--interactive", "--tty", "--hostname=toolbox",
+                  "--name=coreos-toolbox", "--network=host",
+                  "--privileged", "--security-opt=label=disable"]);
     podman.arg(format!("--volume={}:/usr/libexec/toolbox.entrypoint:rslave", self_bin));
     let real_uid : u32 = nix::unistd::getuid().into();
     let uid_plus_one = real_uid + 1;             
@@ -187,13 +193,24 @@ fn run(opts: Opt) -> Fallible<()> {
     }
 
     podman.arg("--entrypoint=/usr/libexec/toolbox.entrypoint");
-    podman.arg(opts.image);
-    eprintln!("running {:?}", podman);
-    return Err(podman.exec().into())
+    podman.arg(&opts.image);
+    podman.stdout(Stdio::null());
+    podman.run()?;
+    Ok(())
+}
+
+fn run(opts: Opt) -> Fallible<()> {
+    create(&opts)?;
+
+    cmd_podman().args(&["start", CONTAINER_NAME]).run()?;
+
+    let mut podman = cmd_podman();
+    podman.args(&["exec", "--interactive", "--tty", CONTAINER_NAME, "/usr/bin/toolbox", "exec"]);
+    return Err(podman.exec().into());
 }
 
 mod entrypoint {
-    use failure::{Fallible, bail};
+    use failure::{Fallible, bail, ResultExt};
     use std::process::Command;
     use std::io::prelude::*;
     use std::path::Path;
@@ -201,6 +218,8 @@ mod entrypoint {
     use std::os::unix;
     use super::CommandRunExt;
     use super::EntrypointState;
+
+    static CONTAINER_INITIALIZED_STAMP : &str = "/run/coreos-toolbox.initialized";
 
     fn remove_file_if_exists<P: AsRef<std::path::Path>>(p: P) -> Fallible<()> {
         let p = p.as_ref();
@@ -211,6 +230,8 @@ mod entrypoint {
         }
     }
 
+    /// Update /etc/passwd with the same user from the host,
+    /// and bind mount the homedir.
     fn adduser(state: &EntrypointState) -> Fallible<()> {
         let uidstr = format!("{}", state.uid);
         Command::new("useradd")
@@ -233,15 +254,16 @@ mod entrypoint {
         Ok(())
     }
 
-    pub(crate) fn entrypoint() -> Fallible<()> {
-        if !Path::new("/run/.containerenv").exists() {
-            bail!("Not running in a container");
+    fn init_container() -> Fallible<()> {
+        let initstamp = Path::new(CONTAINER_INITIALIZED_STAMP);
+        if initstamp.exists() {
+            return Ok(())
         }
-        let statefile = super::getenv_required_utf8("TOOLBOX_STATEFILE")?;
+
         let runtime_dir = super::getenv_required_utf8("XDG_RUNTIME_DIR")?;
         let state : EntrypointState = {
-            let p = format!("/host/{}/{}", runtime_dir, statefile);
-            let f = std::fs::File::open(&p)?;
+            let p = format!("/host/{}/{}", runtime_dir, "coreos-toolbox.initdata");
+            let f = std::fs::File::open(&p).with_context(|e| format!("Opening statefile: {}", e))?;
             std::fs::remove_file(p)?;
             serde_json::from_reader(std::io::BufReader::new(f))?
         };
@@ -269,37 +291,63 @@ mod entrypoint {
         unix::fs::symlink(format!("/host{}", &runtime_dir), runtime_dir_path)?;
 
         // Allow sudo
-        {
+        || -> Fallible<()> {
             let f = std::fs::File::create(format!("/etc/sudoers.d/toolbox-{}", state.username))?;
             let mut f = std::io::BufWriter::new(f);
             writeln!(&mut f, "{} ALL=(ALL) NOPASSWD: ALL", state.username)?;
             f.flush()?;
-        }
+            Ok(())
+        }().with_context(|e| format!("Enabling sudo: {}", e))?;
 
         adduser(&state)?;
+        let _ = std::fs::File::create(&initstamp)?;
 
+        Ok(())
+    }
+
+    /// Called to initialize the container
+    pub(crate) fn entrypoint() -> Fallible<()> {
+        if !Path::new("/run/.containerenv").exists() {
+            bail!("Not running in a container");
+        }
+
+        init_container().with_context(|e| format!("Initializing container: {}", e))?;
+        // And now we just wait for other processes to exec
+        Err(Command::new("sleep").arg("infinity").exec().into())
+    }
+
+
+    pub(crate) fn exec() -> Fallible<()> {
+        let initstamp = Path::new(CONTAINER_INITIALIZED_STAMP);        
+        if !initstamp.exists() {
+            bail!("toolbox not initialized");
+        }
+        let username = super::getenv_required_utf8("USER")?;        
         Err(Command::new("setpriv")
-            .args(&["--ruid", &state.username, "--init-groups", "--inh-caps=-all", "/bin/bash"])
+            .args(&["--ruid", &username, "--init-groups", "--inh-caps=-all", "/bin/bash"])
             .env_remove("TOOLBOX_STATEFILE")
             .exec().into())
     }
 }
 
 /// Primary entrypoint
-fn main() -> Fallible<()> {
-    let argv0 = std::env::args().next().expect("argv0");
-    if argv0.ends_with(".entrypoint") {
-        return entrypoint::entrypoint();
-    }
-    let opts = Opt::from_args();
-    if let Some(cmd) = opts.cmd.as_ref() {
-        match cmd {
-            Cmd::Entrypoint => {
-                return entrypoint::entrypoint();
-            }
+fn main() {
+    || -> Fallible<()> {
+        let argv0 = std::env::args().next().expect("argv0");
+        if argv0.ends_with(".entrypoint") {
+            return entrypoint::entrypoint();
         }
-    } else {
-        run(opts)?;
-    }
-    Ok(())
+        let opts = Opt::from_args();
+        if let Some(cmd) = opts.cmd.as_ref() {
+            match cmd {
+                Cmd::Entrypoint => entrypoint::entrypoint(),
+                Cmd::Exec => entrypoint::exec(),
+            }
+        } else {
+            run(opts)
+        }
+    }().unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        std::process::exit(1)
+    })
 }
