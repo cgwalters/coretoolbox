@@ -81,6 +81,7 @@ fn is_ostree_based_host() -> bool {
     std::path::Path::new("/run/ostree-booted").exists()
 }
 
+#[allow(dead_code)]
 enum InspectType {
     Container,
     Image,
@@ -139,7 +140,7 @@ fn run(opts: Opt) -> Fallible<()> {
     podman.args(&["run", "--rm", "-ti", "--hostname", "toolbox",
                   "--name", "coreos-toolbox", "--network", "host",
                   "--privileged", "--security-opt", "label=disable"]);
-    podman.arg(format!("--volume={}:/toolbox.entrypoint:rslave", self_bin));
+    podman.arg(format!("--volume={}:/usr/libexec/toolbox.entrypoint:rslave", self_bin));
     let real_uid : u32 = nix::unistd::getuid().into();
     let uid_plus_one = real_uid + 1;             
     let max_minus_uid = MAX_UID_COUNT - real_uid;     
@@ -185,19 +186,30 @@ fn run(opts: Opt) -> Fallible<()> {
         w.flush()?;
     }
 
-    podman.arg("--entrypoint=/toolbox.entrypoint");
+    podman.arg("--entrypoint=/usr/libexec/toolbox.entrypoint");
     podman.arg(opts.image);
     eprintln!("running {:?}", podman);
     return Err(podman.exec().into())
 }
 
 mod entrypoint {
-    use failure::{Fallible};
+    use failure::{Fallible, bail};
     use std::process::Command;
+    use std::io::prelude::*;
+    use std::path::Path;
     use std::os::unix::process::CommandExt;
     use std::os::unix;
     use super::CommandRunExt;
     use super::EntrypointState;
+
+    fn remove_file_if_exists<P: AsRef<std::path::Path>>(p: P) -> Fallible<()> {
+        let p = p.as_ref();
+        match std::fs::remove_file(p) {
+            Ok(_) => Ok(()),
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 
     fn adduser(state: &EntrypointState) -> Fallible<()> {
         let uidstr = format!("{}", state.uid);
@@ -222,6 +234,9 @@ mod entrypoint {
     }
 
     pub(crate) fn entrypoint() -> Fallible<()> {
+        if !Path::new("/run/.containerenv").exists() {
+            bail!("Not running in a container");
+        }
         let statefile = super::getenv_required_utf8("TOOLBOX_STATEFILE")?;
         let runtime_dir = super::getenv_required_utf8("XDG_RUNTIME_DIR")?;
         let state : EntrypointState = {
@@ -244,9 +259,29 @@ mod entrypoint {
             unix::fs::symlink(hostd, d)?;
         }
 
+        // Symlink ourself
+        remove_file_if_exists("/usr/bin/toolbox")?;
+        unix::fs::symlink("../libexec/toolbox.entrypoint", "/usr/bin/toolbox")?;
+
+        // Set up runtime dir for this user
+        let runtime_dir_path = std::path::Path::new(&runtime_dir);
+        std::fs::create_dir_all(runtime_dir_path.parent().unwrap())?;
+        unix::fs::symlink(format!("/host{}", &runtime_dir), runtime_dir_path)?;
+
+        // Allow sudo
+        {
+            let f = std::fs::File::create(format!("/etc/sudoers.d/toolbox-{}", state.username))?;
+            let mut f = std::io::BufWriter::new(f);
+            writeln!(&mut f, "{} ALL=(ALL) NOPASSWD: ALL", state.username)?;
+            f.flush()?;
+        }
+
         adduser(&state)?;
 
-        Err(Command::new("su").args(&["-", &state.username]).exec().into())
+        Err(Command::new("setpriv")
+            .args(&["--ruid", &state.username, "--init-groups", "--inh-caps=-all", "/bin/bash"])
+            .env_remove("TOOLBOX_STATEFILE")
+            .exec().into())
     }
 }
 
