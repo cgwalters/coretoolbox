@@ -374,7 +374,7 @@ mod entrypoint {
         nix::unistd::chown(state.home.as_str(), Some(uid), Some(gid))?;
         let host_home = format!("/host{}", state.home);
         Command::new("mount")
-            .args(&["--bind", host_home.as_str(), state.home.as_str()])
+            .args(&["--rbind", host_home.as_str(), state.home.as_str()])
             .run()?;
         Ok(())
     }
