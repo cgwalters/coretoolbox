@@ -10,6 +10,18 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use structopt::StructOpt;
 
+#[derive(Deserialize, Clone, Debug)]
+struct PodmanImageInspect {
+    id: String,
+    names: Vec<String>,
+}
+
+static DEFAULT_IMAGE: &str = "registry.fedoraproject.org/f30/fedora-toolbox:30";
+/// The label set on toolbox images and containers.
+static TOOLBOX_LABEL: &str = "com.coreos.toolbox";
+/// The default container name
+static DEFAULT_NAME: &str = "coreos-toolbox";
+
 lazy_static! {
     static ref APPDIRS: directories::ProjectDirs =
         directories::ProjectDirs::from("com", "coreos", "toolbox").expect("creating appdirs");
@@ -61,18 +73,17 @@ impl CommandRunExt for Command {
 }
 
 #[derive(Debug, StructOpt)]
-struct RunOpts {
+struct CreateOpts {
     #[structopt(
         short = "I",
         long = "image",
-        default_value = "registry.fedoraproject.org/f30/fedora-toolbox:30"
     )]
     /// Use a different base image
-    image: String,
+    image: Option<String>,
 
-    #[structopt(short = "n", long = "name", default_value = "coreos-toolbox")]
+    #[structopt(short = "n", long = "name")]
     /// Name the container
-    name: String,
+    name: Option<String>,
 
     #[structopt(short = "N", long = "nested")]
     /// Allow running inside a container
@@ -81,6 +92,17 @@ struct RunOpts {
     #[structopt(short = "D", long = "destroy")]
     /// Destroy any existing container
     destroy: bool,
+}
+
+#[derive(Debug, StructOpt)]
+struct RunOpts {
+    #[structopt(short = "n", long = "name")]
+    /// Name of container
+    name: Option<String>,
+
+    #[structopt(short = "N", long = "nested")]
+    /// Allow running inside a container
+    nested: bool,
 }
 
 #[derive(Debug, StructOpt)]
@@ -94,6 +116,8 @@ struct RmOpts {
 #[structopt(name = "coretoolbox", about = "Toolbox")]
 #[structopt(rename_all = "kebab-case")]
 enum Opt {
+    /// Create a  toolbox
+    Create(CreateOpts),
     /// Enter the toolbox
     Run(RunOpts),
     /// Delete the toolbox container
@@ -138,6 +162,21 @@ fn podman_has(t: InspectType, name: &str) -> Fallible<bool> {
         .success())
 }
 
+fn podman_get_toolbox_images() -> Fallible<Vec<PodmanImageInspect>> {
+    let proc = cmd_podman()
+        .stdout(std::process::Stdio::piped())
+        .args(&["images", "--output", "json", "--filter"])
+        .arg(format!("label={}=true", TOOLBOX_LABEL))
+        .spawn()?;
+    let sout = proc.stdout.expect("stdout piped");
+    let mut res = Vec::new();
+    for val in serde_json::Deserializer::from_reader(sout).into_iter::<PodmanImageInspect>() {
+        let val = val?;
+        res.push(val);
+    };
+    Ok(res)
+}
+
 /// Pull a container image if not present
 fn ensure_image(name: &str) -> Fallible<()> {
     if !podman_has(InspectType::Image, name)? {
@@ -178,12 +217,32 @@ fn append_preserved_env(c: &mut Command) -> Fallible<()> {
     Ok(())
 }
 
-fn create(opts: &RunOpts) -> Fallible<()> {
-    ensure_image(&opts.image)?;
-
-    if podman_has(InspectType::Container, &opts.name)? {
-        return Ok(());
+fn create(opts: &CreateOpts) -> Fallible<()> {
+    if in_container() && !opts.nested {
+        bail!("Already inside a container");
     }
+
+    let image =
+        if opts.image.is_none() && opts.name.is_none() && !podman_has(InspectType::Container, DEFAULT_NAME)? {
+            let toolboxes = podman_get_toolbox_images()?;
+            match toolboxes.len() {
+                0 => DEFAULT_IMAGE.to_owned(),
+                1 => toolboxes[0].names[0].clone(),
+                _ => bail!("Multiple toolbox images found, must specify via -I"),
+            }
+        } else {
+            opts.image.as_ref().map(|s|s.as_str()).unwrap_or(DEFAULT_IMAGE).to_owned()
+        };
+
+    let name = opts.name.as_ref().map(|s|s.as_str()).unwrap_or(DEFAULT_NAME);
+
+    if opts.destroy {
+        rm(&RmOpts {
+            name: name.to_owned(),
+        })?;
+    }
+
+    ensure_image(&image)?;
 
     // exec ourself as the entrypoint.  In the future this
     // would be better with podman fd passing.
@@ -209,10 +268,10 @@ fn create(opts: &RunOpts) -> Fallible<()> {
         // We are not aiming for security isolation here.
         "--privileged",
         "--security-opt=label=disable",
-        "--label=com.coreos.toolbox=true",
         "--tmpfs=/run:rw",
     ]);
-    podman.arg(format!("--name={}", opts.name));
+    podman.arg(format!("--label={}=true", TOOLBOX_LABEL));
+    podman.arg(format!("--name={}", name));
     // In privileged mode we assume we want to control all host processes by default;
     // we're more about debugging/management and less of a "dev container".
     if privileged {
@@ -260,7 +319,7 @@ fn create(opts: &RunOpts) -> Fallible<()> {
         w.flush()?;
     }
 
-    podman.arg(&opts.image);
+    podman.arg(&image);
     podman.args(&["/usr/bin/toolbox", "internals", "run-pid1"]);
     podman.stdout(Stdio::null());
     podman.run()?;
@@ -276,23 +335,17 @@ fn run(opts: &RunOpts) -> Fallible<()> {
         bail!("Already inside a container");
     }
 
-    if opts.destroy {
-        rm(&RmOpts {
-            name: opts.name.clone(),
-        })?;
-    }
-
-    create(&opts)?;
+    let name = opts.name.as_ref().map(|s|s.as_str()).unwrap_or(DEFAULT_NAME);
 
     cmd_podman()
-        .args(&["start", opts.name.as_str()])
+        .args(&["start", name])
         .stdout(Stdio::null())
         .run()?;
 
     let mut podman = cmd_podman();
     podman.args(&["exec", "--interactive", "--tty"]);
     append_preserved_env(&mut podman)?;
-    podman.args(&[opts.name.as_str(), "/usr/bin/toolbox", "internals", "exec"]);
+    podman.args(&[name, "/usr/bin/toolbox", "internals", "exec"]);
     return Err(podman.exec().into());
 }
 
@@ -619,7 +672,8 @@ fn main() {
         } else {
             let opts = Opt::from_iter(args.iter());
             match opts {
-                Opt::Run(ref runopts) => run(runopts),
+                Opt::Create(ref opts) => create(opts),
+                Opt::Run(ref opts) => run(opts),
                 Opt::Rm(ref opts) => rm(opts),
             }
         }
