@@ -1,5 +1,5 @@
 use directories;
-use failure::{bail, Fallible};
+use failure::{bail, Fallible, ResultExt};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -19,6 +19,8 @@ struct PodmanImageInspect {
 static DEFAULT_IMAGE: &str = "registry.fedoraproject.org/f30/fedora-toolbox:30";
 /// The label set on toolbox images and containers.
 static TOOLBOX_LABEL: &str = "com.coreos.toolbox";
+/// The label set on github.com/debarshiray/fedora-toolbox images and containers.
+static D_TOOLBOX_LABEL: &str = "com.github.debarshiray.toolbox";
 /// The default container name
 static DEFAULT_NAME: &str = "coreos-toolbox";
 
@@ -162,19 +164,31 @@ fn podman_has(t: InspectType, name: &str) -> Fallible<bool> {
         .success())
 }
 
-fn podman_get_toolbox_images() -> Fallible<Vec<PodmanImageInspect>> {
-    let proc = cmd_podman()
+fn podman_inspect_filtered(filter: &str) -> Fallible<Vec<PodmanImageInspect>> {
+    let mut proc = cmd_podman()
         .stdout(std::process::Stdio::piped())
-        .args(&["images", "--output", "json", "--filter"])
-        .arg(format!("label={}=true", TOOLBOX_LABEL))
+        .args(&["images", "--format", "json", "--filter"])
+        .arg(filter)
         .spawn()?;
-    let sout = proc.stdout.expect("stdout piped");
-    let mut res = Vec::new();
-    for val in serde_json::Deserializer::from_reader(sout).into_iter::<PodmanImageInspect>() {
-        let val = val?;
-        res.push(val);
+    let sout = proc.stdout.take().expect("stdout piped");
+    let mut sout = std::io::BufReader::new(sout);
+    let res = if sout.fill_buf()?.len() > 0 {
+        serde_json::from_reader(sout)?
+    } else {
+        Vec::new()
     };
+    if !proc.wait()?.success() {
+        bail!("podman images failed")
+    }
     Ok(res)
+}
+
+fn get_toolbox_images() -> Fallible<Vec<PodmanImageInspect>> {
+    let label = format!("label={}=true", TOOLBOX_LABEL);
+    let mut ret = podman_inspect_filtered(&label).with_context(|e| format!(r#"Finding containers with label "{}": {}"#, TOOLBOX_LABEL, e))?;
+    let dlabel = format!("label={}=true", D_TOOLBOX_LABEL);
+    ret.extend(podman_inspect_filtered(&dlabel).with_context(|e| format!(r#"Finding containers with label "{}": {}"#, D_TOOLBOX_LABEL, e))?);
+    Ok(ret)
 }
 
 /// Pull a container image if not present
@@ -217,6 +231,28 @@ fn append_preserved_env(c: &mut Command) -> Fallible<()> {
     Ok(())
 }
 
+fn get_default_image() -> Fallible<String> {
+    let toolboxes = get_toolbox_images()?;
+    Ok(match toolboxes.len() {
+        0 => {
+            print!("Welcome to coretoolbox
+Enter a pull spec for toolbox image; default: {defimg}
+Image: ", defimg=DEFAULT_IMAGE);
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            input.truncate(input.trim_end().len());
+            if input.is_empty() {
+                DEFAULT_IMAGE.to_owned()
+            } else {
+                input
+            }
+        }
+        1 => toolboxes[0].names[0].clone(),
+        _ => bail!("Multiple toolbox images found, must specify via -I"),
+    })
+}
+
 fn create(opts: &CreateOpts) -> Fallible<()> {
     if in_container() && !opts.nested {
         bail!("Already inside a container");
@@ -224,12 +260,7 @@ fn create(opts: &CreateOpts) -> Fallible<()> {
 
     let image =
         if opts.image.is_none() && opts.name.is_none() && !podman_has(InspectType::Container, DEFAULT_NAME)? {
-            let toolboxes = podman_get_toolbox_images()?;
-            match toolboxes.len() {
-                0 => DEFAULT_IMAGE.to_owned(),
-                1 => toolboxes[0].names[0].clone(),
-                _ => bail!("Multiple toolbox images found, must specify via -I"),
-            }
+            get_default_image()?
         } else {
             opts.image.as_ref().map(|s|s.as_str()).unwrap_or(DEFAULT_IMAGE).to_owned()
         };
@@ -336,6 +367,15 @@ fn run(opts: &RunOpts) -> Fallible<()> {
     }
 
     let name = opts.name.as_ref().map(|s|s.as_str()).unwrap_or(DEFAULT_NAME);
+
+    if !podman_has(InspectType::Container, &name)? {
+        let toolboxes = get_toolbox_images()?;
+        if toolboxes.len() == 0 {
+            bail!("No toolbox container or images found; use `create` to create one")
+        } else {
+            bail!("No toolbox container '{}' found", name)
+        }
+    }
 
     cmd_podman()
         .args(&["start", name])
