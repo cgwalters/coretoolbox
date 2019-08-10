@@ -483,7 +483,7 @@ mod entrypoint {
 
     /// Update /etc/passwd with the same user from the host,
     /// and bind mount the homedir.
-    fn adduser(state: &EntrypointState) -> Fallible<()> {
+    fn adduser(state: &EntrypointState, ostree_based_host: bool) -> Fallible<()> {
         if state.uid == 0 {
             return Ok(());
         }
@@ -507,8 +507,13 @@ mod entrypoint {
         let uid = nix::unistd::Uid::from_raw(state.uid);
         let gid = nix::unistd::Gid::from_raw(state.uid);
         nix::unistd::chown(state.home.as_str(), Some(uid), Some(gid))?;
-        let host_home = format!("/host{}", state.home);
-        rbind(host_home.as_str(), state.home.as_str())?;
+        if ostree_based_host {
+            let host_home = format!("/host/var{}", state.home);
+            rbind(host_home.as_str(), state.home.as_str())?;
+        } else {
+            let host_home = format!("/host{}", state.home);
+            rbind(host_home.as_str(), state.home.as_str())?;
+        }
         Ok(())
     }
 
@@ -639,7 +644,7 @@ mod entrypoint {
         }()
         .with_context(|e| format!("Enabling sudo: {}", e))?;
 
-        adduser(&state)?;
+        adduser(&state, ostree_based_host)?;
         let _ = std::fs::File::create(&initstamp)?;
 
         Ok(())
