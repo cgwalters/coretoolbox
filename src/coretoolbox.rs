@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use structopt::StructOpt;
 
 mod podman;
+mod io_podman;
 mod cmdrunext;
 use cmdrunext::CommandRunExt;
 
@@ -117,6 +118,8 @@ enum InternalOpt {
     RunPid1,
     /// Internal implementation detail; do not use
     Exec,
+    /// Test podman varlink
+    PodmanVarlink,
 }
 
 fn get_toolbox_images() -> Fallible<Vec<podman::ImageInspect>> {
@@ -247,7 +250,9 @@ fn create(opts: &CreateOpts) -> Fallible<()> {
             name: name.to_owned(),
         })?;
     }
-
+    if podman::has_object(podman::InspectType::Container, name)? {
+        bail!("Already have a container '{}'", name);
+    }
     ensure_image(&image)?;
 
     // exec ourself as the entrypoint.  In the future this
@@ -394,6 +399,10 @@ fn list_toolbox_images() -> Fallible<()> {
         }
     }
     Ok(())
+}
+
+fn podman_varlink() -> Fallible<()> {
+    podman::test_varlink()
 }
 
 mod entrypoint {
@@ -687,6 +696,7 @@ fn main() {
             match opts {
                 InternalOpt::Exec => entrypoint::exec(),
                 InternalOpt::RunPid1 => entrypoint::run_pid1(),
+                InternalOpt::PodmanVarlink => podman_varlink(),
             }
         } else {
             let opts = Opt::from_iter(args.iter());
