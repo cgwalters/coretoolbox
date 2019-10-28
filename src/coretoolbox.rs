@@ -43,7 +43,6 @@ static PRESERVED_ENV: &[&str] = &[
     "DISPLAY",
     "USER",
     "LANG",
-    "SHELL",
     "SSH_AUTH_SOCK",
     "TERM",
     "VTE_VERSION",
@@ -470,11 +469,8 @@ mod entrypoint {
         Ok(())
     }
 
-    fn init_container_static() -> Fallible<()> {
+    fn init_container_static() -> Fallible<EntrypointState> {
         let initstamp = Path::new(CONTAINER_INITIALIZED_STAMP);
-        if initstamp.exists() {
-            return Ok(());
-        }
 
         let lockf = std::fs::OpenOptions::new()
             .read(true)
@@ -482,10 +478,6 @@ mod entrypoint {
             .create(true)
             .open(CONTAINER_INITIALIZED_LOCK)?;
         lockf.lock_exclusive()?;
-
-        if initstamp.exists() {
-            return Ok(());
-        }
 
         let runtime_dir = super::get_ensure_runtime_dir()?;
         let state: EntrypointState = {
@@ -495,6 +487,10 @@ mod entrypoint {
             std::fs::remove_file(p)?;
             serde_json::from_reader(std::io::BufReader::new(f))?
         };
+
+        if initstamp.exists() {
+            return Ok(state);
+        }
 
         let ostree_based_host = std::path::Path::new("/host/run/ostree-booted").exists();
 
@@ -559,7 +555,7 @@ mod entrypoint {
         adduser(&state)?;
         let _ = std::fs::File::create(&initstamp)?;
 
-        Ok(())
+        Ok(state)
     }
 
     fn init_container_runtime() -> Fallible<()> {
@@ -626,7 +622,7 @@ mod entrypoint {
         if !super::in_container() {
             bail!("Not inside a container");
         }
-        init_container_static()
+        let state = init_container_static()
             .with_context(|e| format!("Initializing container (static): {}", e))?;
         init_container_runtime()
             .with_context(|e| format!("Initializing container (runtime): {}", e))?;
@@ -636,17 +632,14 @@ mod entrypoint {
         }
         // Set a sane umask (022) by default; something seems to be setting it to 077
         nix::sys::stat::umask(Mode::S_IWGRP | Mode::S_IWOTH);
-        let username = super::getenv_required_utf8("USER")?;
-        let su_preserved_env_arg =
-            format!("--whitelist-environment={}", super::PRESERVED_ENV.join(","));
         Err(Command::new("setpriv")
             .args(&[
                 "--inh-caps=-all",
                 "su",
-                su_preserved_env_arg.as_str(),
-                "-",
-                &username,
+                "--preserve-environment",
+                state.username.as_str(),
             ])
+            .env("HOME", state.home.as_str())
             .env_remove("TOOLBOX_STATEFILE")
             .exec()
             .into())
