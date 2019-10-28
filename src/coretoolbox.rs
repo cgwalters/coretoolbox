@@ -9,8 +9,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use structopt::StructOpt;
 
-mod podman;
 mod cmdrunext;
+mod podman;
 use cmdrunext::CommandRunExt;
 
 static DEFAULT_IMAGE: &str = "registry.fedoraproject.org/f30/fedora-toolbox:30";
@@ -22,6 +22,7 @@ static D_TOOLBOX_LABEL: &str = "com.github.debarshiray.toolbox";
 static DEFAULT_NAME: &str = "coreos-toolbox";
 /// The path to our binary inside the container
 static USR_BIN_SELF: &str = "/usr/bin/coretoolbox";
+static STATE_ENV: &str = "TOOLBOX_STATE";
 
 lazy_static! {
     static ref APPDIRS: directories::ProjectDirs =
@@ -135,7 +136,7 @@ fn get_toolbox_images() -> Fallible<Vec<podman::ImageInspect>> {
             )
         })?,
     );
-    Ok(ret.drain(..).filter(|p| { p.names.is_some() }).collect())
+    Ok(ret.drain(..).filter(|p| p.names.is_some()).collect())
 }
 
 /// Pull a container image if not present
@@ -262,7 +263,6 @@ fn create(opts: &CreateOpts) -> Fallible<()> {
 
     let runtime_dir = get_ensure_runtime_dir()?;
     std::fs::create_dir_all(&runtime_dir)?;
-    let statefile = "coreos-toolbox.initdata";
 
     let mut podman = podman::cmd();
     // The basic arguments.
@@ -315,19 +315,6 @@ fn create(opts: &CreateOpts) -> Fallible<()> {
         }
     }
     append_preserved_env(&mut podman)?;
-    podman.arg(format!("--env=TOOLBOX_STATEFILE={}", statefile));
-
-    {
-        let state = EntrypointState {
-            username: getenv_required_utf8("USER")?,
-            uid: real_uid,
-            home: getenv_required_utf8("HOME")?,
-        };
-        let w = std::fs::File::create(format!("{}/{}", runtime_dir, statefile))?;
-        let mut w = std::io::BufWriter::new(w);
-        serde_json::to_writer(&mut w, &state)?;
-        w.flush()?;
-    }
 
     podman.arg(&image);
     podman.args(&[USR_BIN_SELF, "internals", "run-pid1"]);
@@ -368,6 +355,13 @@ fn run(opts: &RunOpts) -> Fallible<()> {
     let mut podman = podman::cmd();
     podman.args(&["exec", "--interactive", "--tty"]);
     append_preserved_env(&mut podman)?;
+    let state = EntrypointState {
+        username: getenv_required_utf8("USER")?,
+        uid: nix::unistd::getuid().into(),
+        home: getenv_required_utf8("HOME")?,
+    };
+    let state = serde_json::to_string(&state)?;
+    podman.arg(format!("--env={}={}", STATE_ENV, state.as_str()));
     podman.args(&[name, USR_BIN_SELF, "internals", "exec"]);
     return Err(podman.exec().into());
 }
@@ -479,14 +473,8 @@ mod entrypoint {
             .open(CONTAINER_INITIALIZED_LOCK)?;
         lockf.lock_exclusive()?;
 
-        let runtime_dir = super::get_ensure_runtime_dir()?;
-        let state: EntrypointState = {
-            let p = format!("/host/{}/{}", runtime_dir, "coreos-toolbox.initdata");
-            let f =
-                std::fs::File::open(&p).with_context(|e| format!("Opening statefile: {}", e))?;
-            std::fs::remove_file(p)?;
-            serde_json::from_reader(std::io::BufReader::new(f))?
-        };
+        let state: EntrypointState =
+            serde_json::from_str(super::getenv_required_utf8(super::STATE_ENV)?.as_str())?;
 
         if initstamp.exists() {
             return Ok(state);
@@ -581,7 +569,8 @@ mod entrypoint {
             let runtime_dir_p = std::path::Path::new(&runtime_dir);
             if !runtime_dir_p.exists() {
                 std::fs::create_dir_all(runtime_dir_p.parent().expect("runtime dir parent"))?;
-                host_symlink(runtime_dir).with_context(|e| format!("Forwarding runtime dir: {}", e))?;
+                host_symlink(runtime_dir)
+                    .with_context(|e| format!("Forwarding runtime dir: {}", e))?;
             }
         }
 
@@ -640,7 +629,7 @@ mod entrypoint {
                 state.username.as_str(),
             ])
             .env("HOME", state.home.as_str())
-            .env_remove("TOOLBOX_STATEFILE")
+            .env_remove(super::STATE_ENV)
             .exec()
             .into())
     }

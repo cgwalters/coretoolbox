@@ -1,4 +1,4 @@
-use failure::{Fallible, bail};
+use failure::{bail, Fallible};
 use std::process::Command;
 
 pub(crate) trait CommandRunExt {
