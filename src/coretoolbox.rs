@@ -531,17 +531,19 @@ mod entrypoint {
         }
 
         // Allow sudo
-        || -> Fallible<()> {
-            let f = std::fs::File::create(format!("/etc/sudoers.d/toolbox-{}", state.username))?;
-            let mut perms = f.metadata()?.permissions();
-            perms.set_readonly(true);
-            f.set_permissions(perms)?;
-            let mut f = std::io::BufWriter::new(f);
-            writeln!(&mut f, "{} ALL=(ALL) NOPASSWD: ALL", state.username)?;
-            f.flush()?;
-            Ok(())
-        }()
-        .with_context(|e| format!("Enabling sudo: {}", e))?;
+        if Path::new("/etc/sudoers.d").exists() {
+            || -> Fallible<()> {
+                let f = std::fs::File::create(format!("/etc/sudoers.d/toolbox-{}", state.username))?;
+                let mut perms = f.metadata()?.permissions();
+                perms.set_readonly(true);
+                f.set_permissions(perms)?;
+                let mut f = std::io::BufWriter::new(f);
+                writeln!(&mut f, "{} ALL=(ALL) NOPASSWD: ALL", state.username)?;
+                f.flush()?;
+                Ok(())
+            }()
+            .with_context(|e| format!("Enabling sudo: {}", e))?;
+        }
 
         adduser(&state)?;
         let _ = std::fs::File::create(&initstamp)?;
