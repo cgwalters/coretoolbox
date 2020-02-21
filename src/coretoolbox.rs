@@ -79,6 +79,7 @@ struct CreateOpts {
 }
 
 #[derive(Debug, StructOpt)]
+#[structopt(rename_all = "kebab-case")]
 struct RunOpts {
     #[structopt(short = "n", long = "name")]
     /// Name of container
@@ -87,6 +88,10 @@ struct RunOpts {
     #[structopt(short = "N", long = "nested")]
     /// Allow running inside a container
     nested: bool,
+
+    #[structopt(long)]
+    /// Run as (user namespace) root, do not change to unprivileged uid
+    as_userns_root: bool,
 }
 
 #[derive(Debug, StructOpt)]
@@ -112,11 +117,19 @@ enum Opt {
 
 #[derive(Debug, StructOpt)]
 #[structopt(rename_all = "kebab-case")]
+struct ExecOpts {
+    #[structopt(long)]
+    /// See run --as-userns-root
+    as_userns_root: bool,
+}
+
+#[derive(Debug, StructOpt)]
+#[structopt(rename_all = "kebab-case")]
 enum InternalOpt {
     /// Internal implementation detail; do not use
     RunPid1,
     /// Internal implementation detail; do not use
-    Exec,
+    Exec(ExecOpts),
 }
 
 fn get_toolbox_images() -> Fallible<Vec<podman::ImageInspect>> {
@@ -363,6 +376,9 @@ fn run(opts: &RunOpts) -> Fallible<()> {
     let state = serde_json::to_string(&state)?;
     podman.arg(format!("--env={}={}", STATE_ENV, state.as_str()));
     podman.args(&[name, USR_BIN_SELF, "internals", "exec"]);
+    if opts.as_userns_root {
+        podman.arg("--as-userns-root");
+    }
     return Err(podman.exec().into());
 }
 
@@ -391,7 +407,7 @@ fn list_toolbox_images() -> Fallible<()> {
 
 mod entrypoint {
     use super::CommandRunExt;
-    use super::EntrypointState;
+    use super::{EntrypointState, ExecOpts};
     use failure::{bail, Fallible, ResultExt};
     use fs2::FileExt;
     use rayon::prelude::*;
@@ -611,7 +627,7 @@ mod entrypoint {
         Ok(())
     }
 
-    pub(crate) fn exec() -> Fallible<()> {
+    pub(crate) fn exec(opts: ExecOpts) -> Fallible<()> {
         use nix::sys::stat::Mode;
         if !super::in_container() {
             bail!("Not inside a container");
@@ -626,14 +642,22 @@ mod entrypoint {
         }
         // Set a sane umask (022) by default; something seems to be setting it to 077
         nix::sys::stat::umask(Mode::S_IWGRP | Mode::S_IWOTH);
-        Err(Command::new("setpriv")
-            .args(&[
-                "--inh-caps=-all",
-                "su",
-                "--preserve-environment",
-                state.username.as_str(),
-            ])
-            .env("HOME", state.home.as_str())
+        let mut cmd =
+            if opts.as_userns_root {
+                Command::new("/bin/bash")
+            } else {
+                let mut cmd = Command::new("setpriv");
+                cmd.args(&[
+                    "--inh-caps=-all",
+                    "su",
+                    "--preserve-environment",
+                    state.username.as_str(),
+                ])
+                .env("HOME", state.home.as_str());
+                cmd
+            };
+
+        Err(cmd
             .env_remove(super::STATE_ENV)
             .exec()
             .into())
@@ -671,7 +695,7 @@ fn main() {
             args.remove(1);
             let opts = InternalOpt::from_iter(args.iter());
             match opts {
-                InternalOpt::Exec => entrypoint::exec(),
+                InternalOpt::Exec(execopts) => entrypoint::exec(execopts),
                 InternalOpt::RunPid1 => entrypoint::run_pid1(),
             }
         } else {
