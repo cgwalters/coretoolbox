@@ -414,6 +414,7 @@ mod entrypoint {
     use failure::{bail, Fallible, ResultExt};
     use fs2::FileExt;
     use rayon::prelude::*;
+    use std::fs::File;
     use std::io::prelude::*;
     use std::os::unix;
     use std::os::unix::process::CommandExt;
@@ -552,7 +553,7 @@ mod entrypoint {
         // Allow sudo
         if Path::new("/etc/sudoers.d").exists() {
             || -> Fallible<()> {
-                let f = std::fs::File::create(format!("/etc/sudoers.d/toolbox-{}", state.username))?;
+                let f = File::create(format!("/etc/sudoers.d/toolbox-{}", state.username))?;
                 let mut perms = f.metadata()?.permissions();
                 perms.set_readonly(true);
                 f.set_permissions(perms)?;
@@ -565,7 +566,7 @@ mod entrypoint {
         }
 
         adduser(&state)?;
-        let _ = std::fs::File::create(&initstamp)?;
+        let _ = File::create(&initstamp)?;
 
         Ok(state)
     }
@@ -648,25 +649,21 @@ mod entrypoint {
         }
         // Set a sane umask (022) by default; something seems to be setting it to 077
         nix::sys::stat::umask(Mode::S_IWGRP | Mode::S_IWOTH);
-        let mut cmd =
-            if opts.as_userns_root {
-                Command::new("/bin/bash")
-            } else {
-                let mut cmd = Command::new("setpriv");
-                cmd.args(&[
-                    "--inh-caps=-all",
-                    "su",
-                    "--preserve-environment",
-                    state.username.as_str(),
-                ])
-                .env("HOME", state.home.as_str());
-                cmd
-            };
+        let mut cmd = if opts.as_userns_root {
+            Command::new("/bin/bash")
+        } else {
+            let mut cmd = Command::new("setpriv");
+            cmd.args(&[
+                "--inh-caps=-all",
+                "su",
+                "--preserve-environment",
+                state.username.as_str(),
+            ])
+            .env("HOME", state.home.as_str());
+            cmd
+        };
 
-        Err(cmd
-            .env_remove(super::STATE_ENV)
-            .exec()
-            .into())
+        Err(cmd.env_remove(super::STATE_ENV).exec().into())
     }
 
     pub(crate) fn run_pid1() -> Fallible<()> {
