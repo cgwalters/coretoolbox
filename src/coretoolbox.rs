@@ -320,6 +320,9 @@ fn create(opts: &CreateOpts) -> Fallible<()> {
     for p in &["/dev", "/usr", "/var", "/etc", "/run", "/tmp"] {
         podman.arg(format!("--volume={}:/host{}:rslave", p, p));
     }
+    if Path::new("/sysroot").exists() {
+        podman.arg("--volume=/sysroot:/host/sysroot:rslave");
+    }
     if privileged {
         let debugfs = "/sys/kernel/debug";
         if Path::new(debugfs).exists() {
@@ -605,6 +608,9 @@ mod entrypoint {
         }
 
         let ostree_based_host = std::path::Path::new("/host/run/ostree-booted").exists();
+        if ostree_based_host {
+            unix::fs::symlink("sysroot/ostree", "/host/ostree")?;
+        }
 
         // Propagate standard mount points into the container.
         // We make these bind mounts instead of symlinks as
