@@ -440,23 +440,24 @@ mod entrypoint {
 
     /// Update /etc/passwd with the same user from the host,
     /// and bind mount the homedir.
-    fn adduser(state: &EntrypointState) -> Fallible<()> {
+    fn adduser(state: &EntrypointState, with_sudo: bool) -> Fallible<()> {
         if state.uid == 0 {
             return Ok(());
         }
         let uidstr = format!("{}", state.uid);
-        Command::new("useradd")
-            .args(&[
-                "--no-create-home",
-                "--home-dir",
-                &state.home,
-                "--uid",
-                &uidstr,
-                "--groups",
-                "wheel",
-                state.username.as_str(),
-            ])
-            .run()?;
+        let mut cmd = Command::new("useradd");
+        cmd.args(&[
+            "--no-create-home",
+            "--home-dir",
+            &state.home,
+            "--uid",
+            &uidstr,
+        ]);
+        if with_sudo {
+            cmd.args(&["--groups", "wheel"]);
+        }
+        cmd.arg(state.username.as_str());
+        cmd.run()?;
 
         // Bind mount the homedir rather than use symlinks
         // as various software is unhappy if the path isn't canonical.
@@ -551,6 +552,7 @@ mod entrypoint {
         }
 
         // Allow sudo
+        let mut with_sudo = false;
         if Path::new("/etc/sudoers.d").exists() {
             || -> Fallible<()> {
                 let f = File::create(format!("/etc/sudoers.d/toolbox-{}", state.username))?;
@@ -560,12 +562,13 @@ mod entrypoint {
                 let mut f = std::io::BufWriter::new(f);
                 writeln!(&mut f, "{} ALL=(ALL) NOPASSWD: ALL", state.username)?;
                 f.flush()?;
+                with_sudo = true;
                 Ok(())
             }()
             .with_context(|e| format!("Enabling sudo: {}", e))?;
         }
 
-        adduser(&state)?;
+        adduser(&state, with_sudo)?;
         let _ = File::create(&initstamp)?;
 
         Ok(state)
