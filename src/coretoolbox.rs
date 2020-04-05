@@ -666,7 +666,7 @@ mod entrypoint {
         }
         // Set a sane umask (022) by default; something seems to be setting it to 077
         nix::sys::stat::umask(Mode::S_IWGRP | Mode::S_IWOTH);
-        let mut cmd = if opts.as_userns_root {
+        let mut cmd = if opts.as_userns_root || !Path::new("/etc/sudoers.d").exists() {
             Command::new("/bin/bash")
         } else {
             let mut cmd = Command::new("setpriv");
