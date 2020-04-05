@@ -433,8 +433,14 @@ mod entrypoint {
     /// To ensure that paths are the same inside and out.
     static DATADIRS: &[&str] = &["/srv", "/mnt", "/home"];
 
-    fn rbind(src: &str, dest: &str) -> Fallible<()> {
-        Command::new("mount").args(&["--rbind", src, dest]).run()?;
+    fn rbind<S: AsRef<Path>, D: AsRef<Path>>(src: S, dest: D) -> Fallible<()> {
+        let src = src.as_ref();
+        let dest = dest.as_ref();
+        let mut c = Command::new("mount");
+        c.arg("--rbind");
+        c.arg(src);
+        c.arg(dest);
+        c.run()?;
         Ok(())
     }
 
@@ -608,7 +614,15 @@ mod entrypoint {
         // isn't actually permitted.
         let sysfs_selinux = "/sys/fs/selinux";
         if Path::new(sysfs_selinux).join("status").exists() {
-            rbind("/usr/share/empty", sysfs_selinux)?;
+            let empty_path = Path::new("/usr/share/empty");
+            let empty_path = if empty_path.exists() {
+                empty_path
+            } else {
+                let empty_path = Path::new("/usr/share/coretoolbox/empty");
+                std::fs::create_dir_all(empty_path)?;
+                empty_path
+            };
+            rbind(empty_path, sysfs_selinux)?;
         }
 
         let ostree_based_host = std::path::Path::new("/host/run/ostree-booted").exists();
