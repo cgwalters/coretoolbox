@@ -541,6 +541,11 @@ mod entrypoint {
             .try_for_each(host_symlink)
             .with_context(|e| format!("Enabling static host forwards: {}", e))?;
 
+        let ostree_based_host = std::path::Path::new("/host/run/ostree-booted").exists();
+        if ostree_based_host {
+            unix::fs::symlink("sysroot/ostree", "/host/ostree")?;
+        }
+
         // And these are into /dev
         if state.uid != 0 {
             super::FORWARDED_DEVICES
@@ -626,9 +631,6 @@ mod entrypoint {
         }
 
         let ostree_based_host = std::path::Path::new("/host/run/ostree-booted").exists();
-        if ostree_based_host {
-            unix::fs::symlink("sysroot/ostree", "/host/ostree")?;
-        }
 
         // Propagate standard mount points into the container.
         // We make these bind mounts instead of symlinks as
