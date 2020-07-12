@@ -317,19 +317,8 @@ fn create(opts: &CreateOpts) -> Fallible<()> {
         ]);
     }
 
-    for p in &["/dev", "/usr", "/var", "/etc", "/run", "/tmp"] {
-        podman.arg(format!("--volume={}:/host{}:rslave", p, p));
-    }
-    if Path::new("/sysroot").exists() {
-        podman.arg("--volume=/sysroot:/host/sysroot:rslave");
-    }
-    if privileged {
-        let debugfs = "/sys/kernel/debug";
-        if Path::new(debugfs).exists() {
-            // Bind debugfs in privileged mode so we can use e.g. bpftrace
-            podman.arg(format!("--volume={}:{}:rslave", debugfs, debugfs));
-        }
-    }
+    // Bind in the whole host rootfs
+    podman.arg("--volume=/:/host:rslave");
     append_preserved_env(&mut podman)?;
 
     podman.arg(&image);
@@ -511,17 +500,21 @@ mod entrypoint {
 
         // Convert the container to ostree-style layout
         if ostree_based_host {
-            DATADIRS.par_iter().try_for_each(|d| -> Fallible<()> {
-                std::fs::remove_dir(d)?;
-                let vard = format!("var{}", d);
-                unix::fs::symlink(&vard, d)?;
-                std::fs::create_dir(&vard)?;
-                Ok(())
-            })?;
+            DATADIRS
+                .par_iter()
+                .try_for_each(|d| -> Fallible<()> {
+                    std::fs::remove_dir(d)?;
+                    let vard = format!("var{}", d);
+                    unix::fs::symlink(&vard, d)?;
+                    std::fs::create_dir(&vard)?;
+                    Ok(())
+                })
+                .with_context(|e| format!("Converting container to ostree-style layout: {}", e))?;
         }
 
         // This is another mount point used by udisks
-        unix::fs::symlink("/host/run/media", "/run/media")?;
+        unix::fs::symlink("/host/run/media", "/run/media")
+            .with_context(|e| format!("Symlinking /run/media: {}", e))?;
 
         // Remove anaconda cruft
         std::fs::read_dir("/tmp")?.try_for_each(|e| -> Fallible<()> {
@@ -540,11 +533,6 @@ mod entrypoint {
             .par_iter()
             .try_for_each(host_symlink)
             .with_context(|e| format!("Enabling static host forwards: {}", e))?;
-
-        let ostree_based_host = std::path::Path::new("/host/run/ostree-booted").exists();
-        if ostree_based_host {
-            unix::fs::symlink("sysroot/ostree", "/host/ostree")?;
-        }
 
         // And these are into /dev
         if state.uid != 0 {
