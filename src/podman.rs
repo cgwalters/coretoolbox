@@ -12,6 +12,8 @@ pub(crate) enum InspectType {
 
 #[derive(Deserialize, Clone, Debug)]
 pub(crate) struct ImageInspect {
+    // Podman 2.x changed this
+    #[serde(alias="Id")]
     pub id: String,
     pub names: Option<Vec<String>>,
 }
